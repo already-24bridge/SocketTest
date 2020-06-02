@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -8,128 +7,107 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <string.h>
-#include <mysql.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <list>
+#include <map>
 
 using namespace std;
-int iNum;
 
-// mysql 连接
-int connectToMysql(){
-	MYSQL * conn = mysql_init(NULL);
-	conn = mysql_real_connect(conn, "127.0.0.1", "root", "root", "game", 0, NULL, 0);
-	if (!conn){
-		printf("connect mysql error \n");
-		return -1;
+int sockfd;
+socklen_t len;
+struct sockaddr_in serv_addr;
+std::list<int> li; // list 用来存放套接字 这样可以连接多个client
+std::list<int> rli; // 移除连接的client
+std::map<int, string> tNameMap; // [clientfd] = name
+
+void* getConn(void* arg){
+	while(1){
+		int conn = accept(sockfd, (struct sockaddr*)&serv_addr, &len);
+		li.push_back(conn);
+		// printf("conn %d\n", conn);
+		char sName[255];
+		int n = recv(conn, sName, sizeof(sName)-1, 0);
+		string sTemp = sName;
+		sTemp.erase(sTemp.end() -1); // 删除最后一个换行符
+		tNameMap[conn] = sTemp;
+		printf("conn ect %d name = %s\n",conn, sTemp.c_str());
 	}
-	printf("connect mysql success\n");
-	int res = mysql_query(conn, "select * from account");
-	if (res){
-		printf("mysql_query error %s\n", mysql_error(conn));
-		return -1;
-	}else{
-		MYSQL_RES* result = mysql_store_result(conn);
-		if (result){
-			for(int i = 0; i < mysql_num_rows(result); i++){  // 结果行
-				MYSQL_ROW row = mysql_fetch_row(result);
-				for (int j = 0; j < mysql_num_fields(result); j++){ // 结果列
-					printf("%s \t", row[j]);
-				}
-				printf("\n");
-			}
-		}
-		mysql_free_result(result);
-	}
-	mysql_close(conn);
-	return 0;
 }
 
-struct clientInfo
-{	
-	int clientfd;
-	char* sIp;
-};
-
-// 用来接受某个clinet的消息和返回给它收到了
-void* recvThread(void* arg){
-	printf("recvThread start \n");
-	struct clientInfo * temp;
-	temp = (struct clientInfo *) arg;
-	
-	int clientfd = temp->clientfd;
-	char * sClientIp = temp->sIp;
-	char recvBuff[255];
-	char byeBuff[] = "bye";
-
-	fd_set rfds;
+void* recvData(void* arg){
 	struct timeval tv;
-	int retval, maxfd;
+	tv.tv_sec = 15;
+	tv.tv_usec = 0;
 	while(1){
-		// 把可读文件描述符集合清空
-		FD_ZERO(&rfds);
-		// 把标准输入的文件描述符加入到集合中
-		FD_SET(0, &rfds);
-		// 找出文件描述符集合中最大的文件描述符
-		maxfd = 0;
-		FD_SET(clientfd, &rfds);
-		if (maxfd < clientfd){
-			maxfd = clientfd;
+		std::list<int>::iterator it;
+		for (it=li.begin(); it!=li.end(); ++it){
+			fd_set rfds;
+			FD_ZERO(&rfds);
+			int maxfd = 0;
+			int retval = 0;
+			FD_SET(*it, &rfds);
+			if (maxfd < *it){
+				maxfd = *it;
+			}
+			retval = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+			if(retval == -1){
+				printf("select errror\n" );
+			}else if(retval == 0) {
+				// printf("no message waiting\n");
+			}else {
+				char buff[1024];
+				bzero(buff, sizeof(buff)); // memset(buff, 0, sizeof(buff));
+				int len = recv(*it, buff, sizeof(buff)-1, 0);
+				char byeBuff[] = "bye";
+				if (len > 0){
+					printf("recv from[%s] mes = %s \n", tNameMap[*it].c_str(), buff );
+					if (strncmp(buff, byeBuff, 3) == 0 ){ // 这里不使用 strcmp是因为buff的长度是1024 最后是'bye\0' 跟发送来的bye比较值不等 
+						printf("recv %d req close\n", *it);
+						rli.push_back(*it);
+					}
+				}
+			}
 		}
-		// 设置超时时间
-		tv.tv_sec = 5; // 倒计时
-		tv.tv_usec = 0;
-		// 等待聊天
-		retval = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-		if (retval == -1){
-			printf("select error \n");
-			break;
-		}else if (retval == 0){
-			printf("服务端没有输入 客户端也没有信息 等待，，，\n");
-			continue;
-		}else{
-			// 客户端发来消息
-			if(FD_ISSET(clientfd, &rfds)){
-				bzero(recvBuff, sizeof(recvBuff));
-				int n = recv(clientfd, recvBuff, sizeof(recvBuff)-1, NULL);
-				if (n > 0){
-					printf("sClientIp = %s recv msg = %s\n", sClientIp, recvBuff);
-				}
-				if(strcmp(recvBuff, byeBuff) == 0){
-					printf(" ip = %s disconnect\n", sClientIp);
-					char bye[] = "bye";
-					send(clientfd, bye, strlen(bye), NULL);
-					close(clientfd);
-					break;
-				}
-			}
-			// 输入消息
-			if(FD_ISSET(0, &rfds)){
-				char buf[1024];
-				fgets(buf, sizeof(buf), stdin);
-				send(clientfd, buf, sizeof(buf), 0);
-			}
+		for (it = rli.begin(); it != rli.end(); ++it){
+			char buff[] = "bye";
+			printf("send %d bye\n", *it );
+			send(*it, buff, sizeof(buff), 0);
+			li.remove(*it);
+			tNameMap.erase(*it);
+			close(*it);
+		}
+		rli.clear();
+		sleep(1);
+	}
+}
+
+void* sendMess(void* arg){
+	while(1){
+		char buf[1024];
+		fgets(buf, sizeof(buf), stdin);
+		std::list<int>::iterator it;
+		for (it=li.begin(); it!=li.end(); ++it){
+			send(*it, buf, sizeof(buf), 0);
+			printf("send %d msg:%s\n", *it, buf);
 		}
 	}
-	return 0;
 }
 
 int main()
 {	
-	// 连接客户端
-	int iRes = connectToMysql();
 	// scoket准备
 	const char* ip = "127.0.0.1";
 	int port = 7766;
-	int sockfd = socket(PF_INET, SOCK_STREAM, 0); // 创建一个套接字
+	sockfd = socket(PF_INET, SOCK_STREAM, 0); // 创建一个套接字
 	if (sockfd < 0){
 		printf("create sockfd faild\n");
 		return -1;
 	}
 	printf("create sockfd suss\n");
 
-	struct sockaddr_in serv_addr; // 一般是存储地址和ip 用于信息的显示及存储使用
+	memset(&serv_addr, 0, sizeof(serv_addr)); // 一般是存储地址和ip 用于信息的显示及存储使用
 	serv_addr.sin_family = AF_INET;
 	serv_addr.sin_port = htons(port); // 转换为网络字节序，即大端模式
 	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY); // 将主机的无符号长整形数转换为网络字节序 INADDR_ANY就是0.0.0.0 表示不确定地址 或任意地址 
@@ -139,35 +117,31 @@ int main()
 	}
 	printf("bind sockfd suss\n");
 	listen(sockfd, 1024);
+	len = sizeof(serv_addr);
 
-	// 等待客户端连接 并为每个客户端创建一个线程用来接受消息
+	pthread_t connThreadId;
+	if( pthread_create(&connThreadId, NULL, getConn, NULL) != 0 ){
+			printf("create connect thread faild\n");
+			exit(0);
+	}
+	pthread_detach(connThreadId); // 分离线程 将此线程同当前进程分离，使其成为一个独立线程。
+	
+	pthread_t sendThreadId;
+	if( pthread_create(&sendThreadId, NULL, sendMess, NULL) != 0 ){
+			printf("create send thread faild\n");
+			exit(0);
+	}
+	pthread_detach(sendThreadId);
+
+	pthread_t recvThreadId;
+	if( pthread_create(&recvThreadId, NULL, recvData, NULL) != 0 ){
+			printf("create recv thread faild\n");
+			exit(0);
+	}
+	pthread_detach(recvThreadId);
 	while(1){
 
-		struct sockaddr_in client_addr;
-		socklen_t client_addrlength = sizeof(client_addr);
-		int clientfd;
-		clientfd = accept(sockfd, (struct sockaddr*)&client_addr, &client_addrlength);
-		if(clientfd < 0){
-			printf("accept faild\n");
-		}
-		char* sClientIp = inet_ntoa(client_addr.sin_addr);
-		printf("clientfd connect %s \n", sClientIp);
-		// 线程函数参数结构体；
-		struct clientInfo* cInfo;
-		cInfo = (struct clientInfo*)malloc(sizeof(struct clientInfo));
-		cInfo->clientfd = clientfd;
-		cInfo->sIp = sClientIp;
-		pthread_t thredId;
-		// 创建一个线程用来收这个客户端消息
-		if( pthread_create(&thredId, NULL, recvThread, (void*)cInfo) != 0 ){
-			printf("create thread faild\n");
-			exit(0);
-		}
 	}
 	close(sockfd);
 	return 0;
 }
-
-
-
-
